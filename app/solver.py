@@ -15,9 +15,16 @@ Rules implemented here:
 * When no complete assignment exists, a Hall-style capacity-gap proof is
   produced: the subset of manuscripts (fewest first, then lexicographic by
   id) whose demand exceeds the effective capacity of its usable reviewers.
+* ``reassign`` handles a reviewer withdrawal: it revokes every original
+  relation of the withdrawn reviewer, keeps all confirmed relations, and
+  among complete reassignments over the remaining reviewers first retains
+  as many of the other original relations as possible, then minimises the
+  maximum load ratio, then maximises the total match score, and finally
+  takes the lexicographically smallest pair list.
 """
 from __future__ import annotations
 
+from collections.abc import Callable
 from dataclasses import dataclass
 from fractions import Fraction
 from itertools import combinations
@@ -286,6 +293,250 @@ def assign(manuscripts: list[Manuscript], reviewers: list[Reviewer]) -> dict:
                 "score": _as_number(pairs[(manuscript_id, reviewer_id)]),
             }
             for manuscript_id, reviewer_id in assignments
+        ],
+        "total_score": _as_number(total_score),
+        "max_load_ratio": float(max_load_ratio),
+        "loads": loads,
+    }
+
+
+def _residual_min_cost_flow(
+    manuscripts: list[Manuscript],
+    reviewers: list[Reviewer],
+    pairs: dict[tuple[str, str], Fraction],
+    capacities: dict[str, int],
+    weight_of: Callable[[tuple[str, str]], int],
+) -> tuple[int, dict]:
+    """Min-cost flow saturating the (residual) demand exactly.
+
+    The caller guarantees feasibility (checked via max flow beforehand), so
+    ``network_simplex`` always finds a flow satisfying all node demands.
+    """
+    demand = sum(m.required for m in manuscripts)
+    graph = nx.DiGraph()
+    graph.add_node(_SOURCE, demand=-demand)
+    graph.add_node(_SINK, demand=demand)
+    for manuscript in manuscripts:
+        graph.add_edge(
+            _SOURCE, _m_node(manuscript.id), capacity=manuscript.required, weight=0
+        )
+    for pair in pairs:
+        graph.add_edge(
+            _m_node(pair[0]), _r_node(pair[1]), capacity=1, weight=weight_of(pair)
+        )
+    reviewers_in_pairs = {reviewer_id for _, reviewer_id in pairs}
+    for reviewer in reviewers:
+        if reviewer.id in reviewers_in_pairs:
+            graph.add_edge(
+                _r_node(reviewer.id), _SINK, capacity=capacities[reviewer.id], weight=0
+            )
+    return nx.network_simplex(graph)
+
+
+def reassign(
+    manuscripts: list[Manuscript],
+    reviewers: list[Reviewer],
+    original: list[tuple[str, str]],
+    withdrawn_id: str,
+    confirmed: list[tuple[str, str]],
+) -> dict:
+    """Emergency reassignment after reviewer ``withdrawn_id`` withdraws.
+
+    Every original relation of the withdrawn reviewer is revoked; all
+    confirmed relations are kept. Among complete reassignments over the
+    remaining reviewers, the optimisation order is: maximise the number of
+    retained original relations, minimise the maximum load ratio, maximise
+    the total match score, then take the lexicographically smallest sorted
+    ``(manuscript_id, reviewer_id)`` list. Returns ``status: infeasible``
+    (with a reason, and no partial assignment) when none exists.
+
+    Confirmed relations are fixed up front: they reduce the residual
+    manuscript requirements and reviewer capacities, so the residual problem
+    is solved on the remaining slots and merged back afterwards. Because the
+    confirmed part is constant across all solutions, optimising the residual
+    problem optimises the full one.
+    """
+    original_set = set(original)
+    confirmed_set = set(confirmed)
+
+    active = [reviewer for reviewer in reviewers if reviewer.id != withdrawn_id]
+    pairs = allowed_pairs(manuscripts, active)
+
+    if any(pair not in pairs for pair in confirmed_set):
+        return {
+            "status": "infeasible",
+            "reason": "已确认关系中存在匹配分为 0 的不可用组合，无法保留",
+        }
+
+    confirmed_load = {reviewer.id: 0 for reviewer in active}
+    confirmed_count = {manuscript.id: 0 for manuscript in manuscripts}
+    for manuscript_id, reviewer_id in confirmed_set:
+        confirmed_load[reviewer_id] += 1
+        confirmed_count[manuscript_id] += 1
+
+    residual_required = {
+        m.id: m.required - confirmed_count[m.id] for m in manuscripts
+    }
+    residual_manuscripts = [
+        Manuscript(m.id, m.topics, residual_required[m.id])
+        for m in manuscripts
+        if residual_required[m.id] > 0
+    ]
+    residual_pairs = {
+        pair: score
+        for pair, score in pairs.items()
+        if pair not in confirmed_set and residual_required[pair[0]] > 0
+    }
+    # Original relations that may still be kept: not the withdrawer's (no
+    # longer usable) and not already confirmed (fixed up front).
+    retained_candidates = set(residual_pairs) & original_set
+    residual_demand = sum(residual_required.values())
+
+    residual_assignment: list[tuple[str, str]] = []
+    residual_loads = {reviewer.id: 0 for reviewer in active}
+
+    if residual_demand > 0:
+        if not residual_pairs:
+            return {
+                "status": "infeasible",
+                "reason": "退出者撤销后，剩余评审人无法满足全部稿件需求",
+            }
+
+        def retention_weight(pair: tuple[str, str]) -> int:
+            return -1 if pair in retained_candidates else 0
+
+        full_caps = {r.id: r.capacity - confirmed_load[r.id] for r in active}
+        if (
+            _max_flow_value(residual_manuscripts, active, residual_pairs, full_caps)
+            < residual_demand
+        ):
+            return {
+                "status": "infeasible",
+                "reason": "退出者撤销后，剩余评审人无法满足全部稿件需求",
+            }
+
+        # Objective 1: maximise the number of retained original relations.
+        cost, _ = _residual_min_cost_flow(
+            residual_manuscripts, active, residual_pairs, full_caps, retention_weight
+        )
+        max_retention = -cost
+
+        # Objective 2: minimise the maximum load ratio (over total loads,
+        # confirmed included) subject to keeping the maximal retention.
+        candidates: set[Fraction] = {Fraction(0)}
+        for reviewer in active:
+            if reviewer.capacity <= 0:
+                continue
+            # No reviewer can take more manuscripts than exist.
+            for load in range(1, min(reviewer.capacity, len(manuscripts)) + 1):
+                candidates.add(Fraction(load, reviewer.capacity))
+        ordered = sorted(candidates)
+
+        def residual_caps(ratio: Fraction) -> dict[str, int] | None:
+            caps = {}
+            for reviewer in active:
+                cap = _floor(ratio * reviewer.capacity) - confirmed_load[reviewer.id]
+                if cap < 0:
+                    return None
+                caps[reviewer.id] = cap
+            return caps
+
+        def feasible(ratio: Fraction) -> bool:
+            caps = residual_caps(ratio)
+            if caps is None:
+                return False
+            if (
+                _max_flow_value(residual_manuscripts, active, residual_pairs, caps)
+                < residual_demand
+            ):
+                return False
+            cost, _ = _residual_min_cost_flow(
+                residual_manuscripts, active, residual_pairs, caps, retention_weight
+            )
+            return -cost >= max_retention
+
+        # ordered[-1] is feasible: it allows every reviewer at least
+        # min(capacity, #manuscripts) total assignments, which full capacity
+        # never exceeds, and full capacity admits retention max_retention.
+        lo, hi = 0, len(ordered) - 1
+        while lo < hi:
+            mid = (lo + hi) // 2
+            if feasible(ordered[mid]):
+                hi = mid
+            else:
+                lo = mid + 1
+        ratio = ordered[lo]
+
+        # Objectives 3+4: maximise the total score, then take the
+        # lexicographically smallest pair list. One min-cost flow with
+        # weights -(retention * R) - (score * 2^M) - 2^(M-1-rank): R
+        # dominates any sum of score and lexicographic weights, and the
+        # score term dominates any sum of lexicographic weights.
+        denom = 1
+        for score in residual_pairs.values():
+            denom = lcm(denom, score.denominator)
+        int_score = {
+            pair: score.numerator * (denom // score.denominator)
+            for pair, score in residual_pairs.items()
+        }
+        ordered_pairs = sorted(residual_pairs)
+        n_pairs = len(ordered_pairs)
+        score_weight = 1 << n_pairs
+        retention_unit = (sum(int_score.values()) + 1) * score_weight
+        rank = {pair: position for position, pair in enumerate(ordered_pairs)}
+
+        def combined_weight(pair: tuple[str, str]) -> int:
+            weight = -(int_score[pair] * score_weight) - (1 << (n_pairs - 1 - rank[pair]))
+            if pair in retained_candidates:
+                weight -= retention_unit
+            return weight
+
+        caps = residual_caps(ratio)
+        assert caps is not None  # ratio is feasible by construction
+        _, flow = _residual_min_cost_flow(
+            residual_manuscripts, active, residual_pairs, caps, combined_weight
+        )
+        residual_assignment = [
+            pair
+            for pair in ordered_pairs
+            if flow.get(_m_node(pair[0]), {}).get(_r_node(pair[1]), 0)
+        ]
+        residual_loads = {
+            reviewer.id: flow.get(_r_node(reviewer.id), {}).get(_SINK, 0)
+            for reviewer in active
+        }
+
+    new_pairs = sorted(confirmed_set | set(residual_assignment))
+    new_set = set(new_pairs)
+    loads = {reviewer.id: 0 for reviewer in reviewers}
+    for reviewer in active:
+        loads[reviewer.id] = confirmed_load[reviewer.id] + residual_loads[reviewer.id]
+    total_score = sum((pairs[pair] for pair in new_set), Fraction(0))
+    max_load_ratio = max(
+        (
+            Fraction(loads[reviewer.id], reviewer.capacity)
+            for reviewer in reviewers
+            if reviewer.capacity > 0
+        ),
+        default=Fraction(0),
+    )
+    return {
+        "status": "feasible",
+        "assignments": [
+            {
+                "manuscript_id": manuscript_id,
+                "reviewer_id": reviewer_id,
+                "score": _as_number(pairs[(manuscript_id, reviewer_id)]),
+            }
+            for manuscript_id, reviewer_id in new_pairs
+        ],
+        "revoked": [
+            {"manuscript_id": manuscript_id, "reviewer_id": reviewer_id}
+            for manuscript_id, reviewer_id in sorted(original_set - new_set)
+        ],
+        "added": [
+            {"manuscript_id": manuscript_id, "reviewer_id": reviewer_id}
+            for manuscript_id, reviewer_id in sorted(new_set - original_set)
         ],
         "total_score": _as_number(total_score),
         "max_load_ratio": float(max_load_ratio),

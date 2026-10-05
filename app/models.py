@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import math
+from collections import Counter
 from typing import Literal, Union
 
 from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
@@ -109,6 +110,123 @@ class AssignRequest(BaseModel):
         return self
 
 
+class AssignmentRelation(BaseModel):
+    manuscript_id: str = Field(min_length=1, description="稿件 ID")
+    reviewer_id: str = Field(min_length=1, description="评审人 ID")
+
+
+class ReassignRequest(AssignRequest):
+    """应急改派请求：稿件/评审人字段与 /assign 相同，另需原分派、退出者与已确认关系。"""
+
+    model_config = ConfigDict(
+        json_schema_extra={
+            "examples": [
+                {
+                    "manuscripts": [
+                        {"id": "m1", "topics": ["nlp", "ml"], "required_reviewers": 2},
+                        {"id": "m2", "topics": ["vision"], "required_reviewers": 1},
+                    ],
+                    "reviewers": [
+                        {
+                            "id": "r1",
+                            "scores": {"nlp": 5, "ml": 4},
+                            "capacity": 2,
+                            "conflicts": ["m2"],
+                        },
+                        {
+                            "id": "r2",
+                            "scores": {"nlp": 3, "vision": 5},
+                            "capacity": 1,
+                            "conflicts": [],
+                        },
+                        {
+                            "id": "r3",
+                            "scores": {"ml": 4, "vision": 2},
+                            "capacity": 2,
+                            "conflicts": [],
+                        },
+                    ],
+                    "original_assignments": [
+                        {"manuscript_id": "m1", "reviewer_id": "r1"},
+                        {"manuscript_id": "m1", "reviewer_id": "r3"},
+                        {"manuscript_id": "m2", "reviewer_id": "r2"},
+                    ],
+                    "withdrawn_reviewer_id": "r2",
+                    "confirmed": [
+                        {"manuscript_id": "m1", "reviewer_id": "r1"},
+                    ],
+                }
+            ]
+        }
+    )
+
+    original_assignments: list[AssignmentRelation] = Field(
+        description="原完整分派的 (稿件, 评审人) 关系列表"
+    )
+    withdrawn_reviewer_id: str = Field(min_length=1, description="退出评审人的 ID")
+    confirmed: list[AssignmentRelation] = Field(
+        default_factory=list,
+        description="原分派中已确认、必须保留的关系（不得涉及退出者）",
+    )
+
+    @model_validator(mode="after")
+    def _reassign_check(self) -> "ReassignRequest":
+        reviewer_ids = {reviewer.id for reviewer in self.reviewers}
+        if self.withdrawn_reviewer_id not in reviewer_ids:
+            raise ValueError(f"退出者 {self.withdrawn_reviewer_id} 不在评审人列表中")
+
+        required = {m.id: m.required_reviewers for m in self.manuscripts}
+        capacity = {r.id: r.capacity for r in self.reviewers}
+        conflicts = {r.id: set(r.conflicts) for r in self.reviewers}
+        manuscript_ids = set(required)
+
+        original: set[tuple[str, str]] = set()
+        for relation in self.original_assignments:
+            pair = (relation.manuscript_id, relation.reviewer_id)
+            if relation.manuscript_id not in manuscript_ids:
+                raise ValueError(f"原分派包含未知稿件: {relation.manuscript_id}")
+            if relation.reviewer_id not in reviewer_ids:
+                raise ValueError(f"原分派包含未知评审人: {relation.reviewer_id}")
+            if pair in original:
+                raise ValueError(f"原分派包含重复关系: {pair}")
+            original.add(pair)
+            if relation.manuscript_id in conflicts[relation.reviewer_id]:
+                raise ValueError(
+                    f"原分派包含冲突关系: 评审人 {relation.reviewer_id} "
+                    f"与稿件 {relation.manuscript_id} 冲突"
+                )
+
+        per_manuscript = Counter(m_id for m_id, _ in original)
+        for manuscript_id, need in required.items():
+            got = per_manuscript.get(manuscript_id, 0)
+            if got != need:
+                raise ValueError(
+                    f"原分派不满足稿件需求: 稿件 {manuscript_id} "
+                    f"需要 {need} 名评审人，实际 {got} 名"
+                )
+        per_reviewer = Counter(r_id for _, r_id in original)
+        for reviewer_id, load in per_reviewer.items():
+            if load > capacity[reviewer_id]:
+                raise ValueError(
+                    f"原分派超出评审人容量: 评审人 {reviewer_id} "
+                    f"容量 {capacity[reviewer_id]}，实际 {load} 篇"
+                )
+
+        confirmed: set[tuple[str, str]] = set()
+        for relation in self.confirmed:
+            pair = (relation.manuscript_id, relation.reviewer_id)
+            if pair in confirmed:
+                raise ValueError(f"已确认关系重复: {pair}")
+            confirmed.add(pair)
+            if pair not in original:
+                raise ValueError(f"已确认关系 {pair} 不属于原分派")
+            if relation.reviewer_id == self.withdrawn_reviewer_id:
+                raise ValueError(
+                    f"已确认关系涉及退出者 {self.withdrawn_reviewer_id}，无法保留"
+                )
+        return self
+
+
 class AssignmentOut(BaseModel):
     manuscript_id: str = Field(description="稿件 ID")
     reviewer_id: str = Field(description="评审人 ID")
@@ -144,4 +262,26 @@ class HealthResponse(BaseModel):
     status: Literal["ok"] = "ok"
 
 
+class ReassignFeasibleResponse(BaseModel):
+    status: Literal["feasible"] = "feasible"
+    assignments: list[AssignmentOut] = Field(
+        description="改派后的完整分派，按 (稿件 ID, 评审人 ID) 字典序排列"
+    )
+    revoked: list[AssignmentRelation] = Field(
+        description="相对原分派被撤销的关系（含退出者的全部关系），按 (稿件 ID, 评审人 ID) 排序"
+    )
+    added: list[AssignmentRelation] = Field(
+        description="相对原分派新增的关系，按 (稿件 ID, 评审人 ID) 排序"
+    )
+    total_score: float = Field(description="总匹配分")
+    max_load_ratio: float = Field(description="评审人最大负载率（在最大保留前提下已最小化）")
+    loads: dict[str, int] = Field(description="每名评审人被指派的稿件数（退出者为 0）")
+
+
+class ReassignInfeasibleResponse(BaseModel):
+    status: Literal["infeasible"] = "infeasible"
+    reason: str = Field(description="无解原因")
+
+
 AssignResponse = Union[FeasibleResponse, InfeasibleResponse]
+ReassignResponse = Union[ReassignFeasibleResponse, ReassignInfeasibleResponse]
